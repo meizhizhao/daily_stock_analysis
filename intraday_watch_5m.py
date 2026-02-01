@@ -13,12 +13,11 @@ import akshare as ak
 BJ = tz.gettz("Asia/Shanghai")
 STATE_PATH = "intraday_state.json"
 
-# 固定：TopN=5（情绪票可用；大票建议改为3-4）
+# 固定：TopN=5
 TOPN = 5
 
-# 每只票LLM最小调用间隔（分钟）：防“同一只票每分钟都叫一次”
-# 风险事件（VOL_DOWN/VOL_STALL/关键锚位失守）可破例立即推送
-SYM_LLM_COOLDOWN_MIN = int(os.getenv("SYM_LLM_COOLDOWN_MIN", "4"))
+# 快照冷却（分钟）：LLM冷却期间的“无LLM快照”提示，防止信号盲区
+SNAPSHOT_COOLDOWN_MIN = 2
 
 # 事件优先级（越小越重要）
 PRIO = {
@@ -42,9 +41,6 @@ PRIO = {
     "BREAK_CONFIRM_VOL": 4,
     "AMT_SPIKE_5M": 4,
     "AMT_SPIKE_1M": 4,
-
-    # RS（过滤/持有置信）
-    # 注意：RS_DIVERGENCE_XXXX 用 event_rank 特判
 
     # proxy（⑤⑥⑦）
     "ACTIVE_PROXY_SHIFT": 6,
@@ -269,7 +265,7 @@ def resample_1m_to_5m(df1_norm):
 
     d = df1_norm.copy()
 
-    # Must-fix：确保 time 为 pandas datetime，才能用 .dt
+    # 确保能 .dt
     d["time"] = pd.to_datetime(d["time"], errors="coerce")
     d = d.dropna(subset=["time"])
     if d.empty:
@@ -289,8 +285,10 @@ def resample_1m_to_5m(df1_norm):
     # 丢掉尚未完成的最后一桶（防止当前5m桶未收盘就聚合）
     nowt = now_bj()
     if not agg.empty:
-        last_bucket = agg["time"].iloc[-1].to_pydatetime().replace(tzinfo=BJ)
-        if (last_bucket + timedelta(minutes=5)) > nowt:
+        last_bucket = agg["time"].iloc[-1]
+        # 转为 tz-aware datetime 进行比较
+        last_bucket_dt = last_bucket.to_pydatetime().replace(tzinfo=BJ)
+        if (last_bucket_dt + timedelta(minutes=5)) > nowt:
             agg = agg.iloc[:-1]
 
     # time 回填为 tz-aware python datetime，保持与其它逻辑一致
@@ -477,15 +475,12 @@ def calc_rs_z_aligned(stock_5m_norm, index_5m_norm, cutoff: datetime, window: in
     if len(m) < window + 5:
         return None
 
-    m = m[(pd.to_numeric(m["open_s"], errors="coerce") != 0) & (pd.to_numeric(m["open_i"], errors="coerce") != 0)]
-    if len(m) < window + 5:
-        return None
-
     m["open_s"] = pd.to_numeric(m["open_s"], errors="coerce")
     m["close_s"] = pd.to_numeric(m["close_s"], errors="coerce")
     m["open_i"] = pd.to_numeric(m["open_i"], errors="coerce")
     m["close_i"] = pd.to_numeric(m["close_i"], errors="coerce")
     m = m.dropna(subset=["open_s","close_s","open_i","close_i"])
+    m = m[(m["open_s"] != 0) & (m["open_i"] != 0)]
     if len(m) < window + 5:
         return None
 
@@ -509,9 +504,10 @@ def calc_rs_z_aligned(stock_5m_norm, index_5m_norm, cutoff: datetime, window: in
 # Event ranking / prompt
 # =========================
 def is_risk_event(tp: str) -> bool:
+    # ✅ 扩大风险范围：所有失守锚位都算风险（至少ORB_L/跨日锚非常关键）
     if tp in ("VOL_DOWN", "VOL_STALL"):
         return True
-    if tp.startswith("ANCHOR_LOSE_PREV_"):
+    if tp.startswith("ANCHOR_LOSE_"):
         return True
     return False
 
@@ -548,6 +544,7 @@ def main():
     index_list = os.getenv("INDEX_LIST", "000300,000001").strip()
 
     cooldown_min = int(os.getenv("COOLDOWN_MIN", "15"))
+    sym_llm_cd = int(os.getenv("SYM_LLM_COOLDOWN_MIN", "4"))  # ✅ 挪到main，便于配置/核对
     orb_buffer_bp = int(os.getenv("ORB_BUFFER_BP", "10"))
     max_tokens = int(os.getenv("MAX_TOKENS", "450"))
 
@@ -563,6 +560,8 @@ def main():
         raise SystemExit("Missing STOCK_LIST")
     if not (base_url and api_key and model):
         raise SystemExit("Missing OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL")
+
+    print(f"COOLDOWN_MIN={cooldown_min}min; SYM_LLM_COOLDOWN_MIN={sym_llm_cd}min; SNAPSHOT_COOLDOWN_MIN={SNAPSHOT_COOLDOWN_MIN}min")
 
     symbols = [s.strip() for s in stock_list.split(",") if s.strip()]
     idx_codes = [x.strip() for x in index_list.split(",") if x.strip()]
@@ -682,9 +681,8 @@ def main():
         o = safe_float(last5.get("open"))
         c = safe_float(last5.get("close"))
         amt5 = safe_float(last5.get("amt"))
-        vol5 = safe_float(last5.get("vol"))
 
-        # 5m 成交额基准（动态，修复nan混入）
+        # 5m 成交额基准（动态）
         amt_series_5m = pd.to_numeric(df5["amt"], errors="coerce").dropna().astype(float).tolist()
         amt_ma_5m = ma_dyn(amt_series_5m, 20, min_len=6)
 
@@ -749,7 +747,7 @@ def main():
                 events.append({"type": "AMT_SPIKE_1M", "dir": "both",
                                "facts": {"t": fmt_dt(last1["time"]), "amt1": amt1, "ma_dyn_or_orb": amt_ma_1m, "ratio": ratio1}})
 
-        # ========== 放量确认（只在结构发生时才入池，防泛滥） ==========
+        # ========== 放量确认（只在结构发生时才入池） ==========
         if has_structure and amt5 is not None and amt_ma_5m not in (None, 0):
             ratio = amt5 / amt_ma_5m
             if ratio >= 2.0:
@@ -780,7 +778,7 @@ def main():
             if lp:
                 events.append({"type": lp["type"], "dir": lp["dir"], "facts": lp["facts"]})
 
-        # ========== ⑧ RS 偏离（按time对齐；指数缺失则本轮跳过RS） ==========
+        # ========== ⑧ RS 偏离 ==========
         for idx_code, idxdf in idx_5m.items():
             if idxdf is None or getattr(idxdf, "empty", True):
                 continue
@@ -806,17 +804,27 @@ def main():
         # ========== 每只票 LLM 调用冷却（风险事件可破例） ==========
         has_risk = any(is_risk_event(e["type"]) for e in filtered_events)
         llm_key = f"{sym}|LLM_CALL"
-        if (not has_risk) and (not should_push(state, llm_key, SYM_LLM_COOLDOWN_MIN, now_ts)):
-            # 不触发LLM，仅跳过（避免刷屏）
+
+        if (not has_risk) and (not should_push(state, llm_key, sym_llm_cd, now_ts)):
+            # ✅ LLM 冷却期间：发“精简快照”，不调用 LLM（避免信号盲区）
+            snap_key = f"{sym}|SNAP"
+            if should_push(state, snap_key, SNAPSHOT_COOLDOWN_MIN, now_ts):
+                top3 = sorted(filtered_events, key=event_rank)[:3]
+                brief = "\n".join([
+                    f"- {e['type']} dir={e['dir']} facts={json.dumps(e['facts'], ensure_ascii=False)}"
+                    for e in top3
+                ])
+                feishu_send_text(webhook, f"【盘中快照(无LLM)】{today} {sym}\n{brief}")
+                mark_push(state, snap_key, now_ts)
             continue
 
         # ========== 排序 ==========
         filtered_events = sorted(filtered_events, key=event_rank)
 
-        # ========== TopN 组装：强制置顶风险/关键锚位失守 ==========
+        # ========== TopN 组装：强制置顶风险/关键失守 ==========
         must = []
         for e in filtered_events:
-            if e["type"] in ("VOL_DOWN", "VOL_STALL") or e["type"].startswith("ANCHOR_LOSE_PREV_"):
+            if is_risk_event(e["type"]):
                 must.append(e)
 
         # 去重（按 type+dir 去重）
@@ -846,7 +854,6 @@ def main():
                 break
             send_events.append(e)
 
-        # 附录仅提示
         send_set = set((e["type"], e["dir"]) for e in send_events)
         rest_events = [e for e in filtered_events if (e["type"], e["dir"]) not in send_set]
 
@@ -867,12 +874,12 @@ def main():
         msg = f"【盘中5m监控】{today} {sym} | 事件入LLM={len(send_events)}/{len(filtered_events)}(TopN={TOPN})\n" + analysis
         feishu_send_text(webhook, msg)
 
-        # 标记：事件冷却（只标记 send_events，避免“未入LLM也冷却导致丢信号”）
+        # 标记：事件冷却（只标记 send_events）
         for e in send_events:
             k = f"{sym}|{e['type']}|{e['dir']}"
             mark_push(state, k, now_ts)
 
-        # 标记：整票LLM调用冷却（风险也标记，减少高频重复）
+        # 标记：整票LLM调用冷却
         mark_push(state, llm_key, now_ts)
 
     save_state(state)
