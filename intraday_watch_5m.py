@@ -13,18 +13,16 @@ import akshare as ak
 BJ = tz.gettz("Asia/Shanghai")
 STATE_PATH = "intraday_state.json"
 
-# =========================
-# Config (TopN固定为5)
-# =========================
+# 固定：TopN=5
 TOPN = 5
 
 # 事件优先级（越小越重要）
 PRIO = {
-    # 1) 风险类（最影响决策）
+    # 风险类（最影响决策）
     "VOL_DOWN": 1,
     "VOL_STALL": 1,
 
-    # 2) 锚位突破/失守（跨日锚优先）
+    # 锚位突破/失守（跨日锚优先）
     "ANCHOR_LOSE_PREV_H": 2,
     "ANCHOR_LOSE_PREV_C": 2,
     "ANCHOR_LOSE_PREV_L": 2,
@@ -32,27 +30,23 @@ PRIO = {
     "ANCHOR_BREAK_PREV_C": 2,
     "ANCHOR_BREAK_PREV_L": 2,
 
-    # 3) ORB（次一级结构）
+    # ORB
     "ORB_UP_BREAK": 3,
     "ORB_DN_BREAK": 3,
 
-    # 4) 放量确认/Spike（作为确认）
+    # 放量确认/Spike（确认）
     "BREAK_CONFIRM_VOL": 4,
     "AMT_SPIKE_5M": 4,
     "AMT_SPIKE_1M": 4,
 
-    # 5) RS（相对强弱）
-    # RS_DIVERGENCE_* 运行时匹配 -> rank=5
-
-    # 6) proxy（⑤⑥⑦）
+    # proxy（⑤⑥⑦）
     "ACTIVE_PROXY_SHIFT": 6,
     "LIMIT_TOUCH": 6,
     "LIMIT_SEALED": 6,
     "LIMIT_BREAK": 6,
     "LIMIT_RESEAL": 6,
-
-    # 99) 兜底
 }
+
 
 # =========================
 # Time helpers
@@ -93,7 +87,7 @@ def std(arr, n):
     return math.sqrt(v)
 
 def ma_dyn(arr, n, min_len=8):
-    """动态窗口均值：min(n, len(arr))，但要求至少 min_len 个样本才算。"""
+    """动态窗口均值：min(n, len(arr))，但至少 min_len 个样本才算。"""
     if arr is None:
         return None
     k = min(n, len(arr))
@@ -110,6 +104,7 @@ def retry(fn, times=3, sleep_s=1.2, desc=""):
             last = e
             time.sleep(sleep_s * (i + 1))
     raise last
+
 
 # =========================
 # State (cooldown / ORB)
@@ -139,6 +134,7 @@ def should_push(state, key: str, cooldown_min: int, now_ts: float) -> bool:
 def mark_push(state, key: str, now_ts: float):
     state.setdefault("last_push", {})[key] = now_ts
 
+
 # =========================
 # Feishu push
 # =========================
@@ -146,6 +142,7 @@ def feishu_send_text(webhook: str, text: str):
     payload = {"msg_type": "text", "content": {"text": text}}
     r = requests.post(webhook, json=payload, timeout=15)
     r.raise_for_status()
+
 
 # =========================
 # LLM (OpenAI-compatible)
@@ -176,6 +173,7 @@ def llm_analyze(base_url: str, api_key: str, model: str, prompt: str, max_tokens
     data = r.json()
     return data["choices"][0]["message"]["content"]
 
+
 # =========================
 # Time parser (Must-fix 1.3)
 # =========================
@@ -199,15 +197,17 @@ def _parse_time_any(x):
     except Exception:
         raise ValueError(f"Unrecognized time format: {repr(x)}")
 
+
 # =========================
 # AKShare fetch + normalize
 # =========================
 def normalize_min_df(df):
     """
     标准化成列：time, open, high, low, close, vol, amt
+    Must: 输入为空直接 raise（不要返回 None）
     """
     if df is None or df.empty:
-        return None
+        raise ValueError("normalize_min_df: input df is None or empty")
 
     cols = set(df.columns)
     time_col = "时间" if "时间" in cols else ("日期" if "日期" in cols else None)
@@ -242,6 +242,40 @@ def fetch_index_min(symbol: str, period: str, start_dt: str, end_dt: str):
             symbol=symbol, period=period, start_date=start_dt, end_date=end_dt
         )
     return retry(_fn, desc=f"index_min {symbol} {period}")
+
+
+# =========================
+# Enhancement: 1m -> 5m resample (fallback)
+# =========================
+def resample_1m_to_5m(df1_norm):
+    """
+    用 1m 聚合成 5m（保证 5m 源断连时不断档）
+    输出列：time/open/high/low/close/vol/amt
+    """
+    if df1_norm is None or df1_norm.empty:
+        return None
+
+    d = df1_norm.copy()
+    d["bucket"] = d["time"].dt.floor("5min")
+
+    agg = d.groupby("bucket").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        vol=("vol", "sum"),
+        amt=("amt", "sum"),
+    ).reset_index().rename(columns={"bucket": "time"})
+
+    # 丢掉尚未完成的最后一桶（防止当前5m桶未收盘就聚合）
+    nowt = now_bj()
+    if not agg.empty:
+        last_bucket = agg["time"].iloc[-1]
+        if (last_bucket + timedelta(minutes=5)) > nowt:
+            agg = agg.iloc[:-1]
+
+    return agg.reset_index(drop=True)
+
 
 # =========================
 # Must-fix 1.1: prev OHLC date selection
@@ -282,10 +316,13 @@ def fetch_prev_day_ohlc(symbol: str, yyyymmdd: str):
         "close": safe_float(prev.get("收盘")),
     }
 
+
 # =========================
 # Bars / ORB
 # =========================
 def get_last_completed_bar(df_norm, cutoff: datetime):
+    if df_norm is None or getattr(df_norm, "empty", True):
+        return None
     d2 = df_norm[df_norm["time"] <= cutoff]
     if d2.empty:
         return None
@@ -294,7 +331,7 @@ def get_last_completed_bar(df_norm, cutoff: datetime):
 def calc_orb(one_min_norm, orb_buffer_bp: int):
     """
     ORB: 09:30-09:34
-    同时返回 ORB 1m 平均成交额，作为早盘 Spike 的兜底基准（Should-fix 2.1）
+    同时返回 ORB 1m 平均成交额，作为早盘 Spike 的兜底基准
     """
     if one_min_norm is None or one_min_norm.empty:
         return None
@@ -316,7 +353,7 @@ def calc_orb(one_min_norm, orb_buffer_bp: int):
     return {"orb_h": orb_h, "orb_l": orb_l, "buf": buf, "orb_amt_mean_1m": orb_amt_mean_1m}
 
 def estimate_limit_up(symbol: str, prev_close: float):
-    # proxy：300/688 20%，其他 10%（未处理ST等特殊涨跌幅；LLM输出会明确标注proxy边界）
+    # proxy：300/688 20%，其他 10%（未处理ST等特殊涨跌幅）
     pct = 0.2 if (symbol.startswith("300") or symbol.startswith("688")) else 0.1
     return round(prev_close * (1 + pct), 2)
 
@@ -359,6 +396,7 @@ def limitup_proxy(one_min_norm, limit_up: float):
                       "reseal_minutes_proxy": minutes, "limit_up": limit_up,
                       "note": "⑥⑦ proxy：回封耗时(分钟级)"}}
 
+
 # =========================
 # Should-fix 2.3: active proxy with guards
 # =========================
@@ -393,6 +431,7 @@ def active_proxy(one_min_norm, min_tot_amt_last30=5e6):
             "tot_amt_last30": tot1,
             "note": "⑤ proxy：以上涨K线成交额占比近似主动买盘占比(非逐笔主动买)"}  # 明确边界
 
+
 # =========================
 # Must-fix 1.2: RS aligned by time join
 # =========================
@@ -401,12 +440,22 @@ def calc_rs_z_aligned(stock_5m_norm, index_5m_norm, cutoff: datetime, window: in
     ⑧ 正确性版本：按 time inner join 对齐后计算 rs_series rolling mean/std
     rs = (stock_close/stock_open-1) - (idx_close/idx_open-1)
     """
+    if stock_5m_norm is None or stock_5m_norm.empty:
+        return None
+    if index_5m_norm is None or index_5m_norm.empty:
+        return None
+
     s = stock_5m_norm[stock_5m_norm["time"] <= cutoff][["time","open","close"]].copy()
     i = index_5m_norm[index_5m_norm["time"] <= cutoff][["time","open","close"]].copy()
     if s.empty or i.empty:
         return None
 
     m = s.merge(i, on="time", how="inner", suffixes=("_s","_i")).sort_values("time")
+    if len(m) < window + 5:
+        return None
+
+    # 避免除0
+    m = m[(m["open_s"] != 0) & (m["open_i"] != 0)]
     if len(m) < window + 5:
         return None
 
@@ -425,6 +474,7 @@ def calc_rs_z_aligned(stock_5m_norm, index_5m_norm, cutoff: datetime, window: in
     last_t = m["time"].iloc[-1]
     return {"t": fmt_dt(last_t), "rs": rs_last, "z": z}
 
+
 # =========================
 # Event ranking / prompt
 # =========================
@@ -440,17 +490,16 @@ def build_prompt(symbol: str, idx_list: str, send_events: list, rest_events: lis
     lines.append(f"北京时间: {context['now_bj']}")
     lines.append(f"基准指数: {idx_list}")
     lines.append("")
-    lines.append("触发事件（TopN=5，证据必须带日期时间+数值）：")
+    lines.append(f"触发事件（TopN={TOPN}，证据必须带日期时间+数值）：")
     for e in send_events:
         lines.append(f"- {e['type']} | dir={e['dir']} | facts={json.dumps(e['facts'], ensure_ascii=False)}")
-
     if rest_events:
         lines.append("")
         lines.append("附录(未入LLM，仅作提示): " + ", ".join([x["type"] for x in rest_events[:15]]))
-
     lines.append("")
     lines.append("注意：⑤⑥⑦为proxy近似，必须显式标注，不可当作L2逐笔/盘口结论。")
     return "\n".join(lines)
+
 
 # =========================
 # Main
@@ -483,7 +532,6 @@ def main():
 
     t = now_bj()
     if (not force_run) and (not in_trading_session(t)):
-        # 非交易时段：直接退出（不推送不烧钱）
         print(f"Not in trading session: {t.isoformat()}; exit.")
         return
 
@@ -492,7 +540,7 @@ def main():
     start_dt = f"{today} 09:30:00"
     end_dt = f"{today} 15:00:00"
 
-    # Should-fix 3.1：错开分钟边界（workflow sleep 15后，这里再留cutoff=now-1m）
+    # workflow建议 sleep 15，这里仍用 now-1m 取“已完成bar”
     cutoff = t - timedelta(minutes=1)
 
     state = load_state()
@@ -501,45 +549,81 @@ def main():
 
     now_ts = time.time()
 
-    # -------- index 5m ----------
+    # 错误推送冷却（统一入口）
+    def push_err(sym: str, err_key: str, text: str):
+        k = f"{sym}|{err_key}"
+        if should_push(state, k, cooldown_min, now_ts):
+            feishu_send_text(webhook, text)
+            mark_push(state, k, now_ts)
+
+    # -------- index 5m (with fallback 1m->5m) ----------
     idx_5m = {}
     for idx in idx_codes:
+        idxdf = None
+        # 先取 5m
         try:
             raw = fetch_index_min(idx, "5", start_dt, end_dt)
-            idx_5m[idx] = normalize_min_df(raw)
+            idxdf = normalize_min_df(raw)
         except Exception as e:
-            # 指数失败不刷屏（只打印）
-            print(f"Index fetch failed {idx}: {repr(e)}")
+            idxdf = None
+            print(f"Index 5m fetch failed {idx}: {repr(e)}")
+
+        # fallback：1m->5m
+        if idxdf is None or idxdf.empty:
+            try:
+                raw1 = fetch_index_min(idx, "1", start_dt, end_dt)
+                idx1 = normalize_min_df(raw1)
+                idxdf = resample_1m_to_5m(idx1)
+                if idxdf is None or idxdf.empty:
+                    idxdf = None
+                else:
+                    print(f"Index fallback ok {idx}: 1m->5m")
+            except Exception as e:
+                print(f"Index 1m fallback failed {idx}: {repr(e)}")
+                idxdf = None
+
+        idx_5m[idx] = idxdf
 
     # -------- per stock ----------
     for sym in symbols:
-        # 错误推送也做 cooldown（Nice-to-have 3.2）
-        def push_err_once(msg):
-            k = f"{sym}|ERROR"
-            if should_push(state, k, cooldown_min, now_ts):
-                feishu_send_text(webhook, msg)
-                mark_push(state, k, now_ts)
-
-        # 拉分钟线
+        # 1) 拉 1m（关键，可聚合5m）
+        df1 = None
         try:
             raw_1m = fetch_stock_min(sym, "1", start_dt, end_dt)
-            raw_5m = fetch_stock_min(sym, "5", start_dt, end_dt)
             df1 = normalize_min_df(raw_1m)
+        except Exception as e:
+            df1 = None
+            push_err(sym, "FETCH_1M_FAIL", f"【盘中5m监控】{today} {sym}\n1m数据拉取失败: {repr(e)}")
+
+        # 2) 拉 5m
+        df5 = None
+        try:
+            raw_5m = fetch_stock_min(sym, "5", start_dt, end_dt)
             df5 = normalize_min_df(raw_5m)
         except Exception as e:
-            push_err_once(f"【盘中5m监控】{today} {sym}\n数据拉取失败: {repr(e)}")
-            continue
+            df5 = None
+            print(f"5m fetch failed {sym}: {repr(e)}")
 
+        # 3) 5m fallback：1m聚合5m
+        if df5 is None or df5.empty:
+            if df1 is not None and (not df1.empty):
+                df5 = resample_1m_to_5m(df1)
+                if df5 is None or getattr(df5, "empty", True):
+                    push_err(sym, "RESAMPLE_5M_FAIL", f"【盘中5m监控】{today} {sym}\n1m聚合5m失败或为空，本轮跳过")
+                    continue
+                else:
+                    push_err(sym, "DEGRADE_5M", f"【盘中5m监控】{today} {sym}\n5m源不可用，已用1m聚合生成5m（降级运行）")
+            else:
+                push_err(sym, "FETCH_BOTH_EMPTY", f"【盘中5m监控】{today} {sym}\n1m/5m均不可用，本轮跳过（监控不断档）")
+                continue
+
+        one_min_available = (df1 is not None and (not df1.empty))
+
+        # 取最后已完成的 5m bar
         last5 = get_last_completed_bar(df5, cutoff)
         if last5 is None:
-            # 数据未更新到上一根bar，直接跳过
+            # 数据尚未更新到上一根完成bar，跳过本轮
             continue
-
-        # ORB（每日保存一次）
-        orb = calc_orb(df1, orb_buffer_bp)
-        if orb:
-            state.setdefault("orb", {})[sym] = orb
-        orb = state.get("orb", {}).get(sym)
 
         # 昨日 OHLC（Must-fix 1.1）
         prev = None
@@ -548,24 +632,36 @@ def main():
         except Exception as e:
             print(f"Prev day fetch failed {sym}: {repr(e)}")
 
-        # 当前 5m bar
+        # ORB（如果1m可用则计算；否则尝试用state里同日缓存）
+        orb = None
+        if one_min_available:
+            try:
+                orb = calc_orb(df1, orb_buffer_bp)
+                if orb:
+                    state.setdefault("orb", {})[sym] = orb
+            except Exception as e:
+                print(f"ORB calc failed {sym}: {repr(e)}")
+        orb = state.get("orb", {}).get(sym)
+
+        # 当前 5m bar 数据
         bar_t = last5["time"]
         o = safe_float(last5["open"])
         c = safe_float(last5["close"])
-        amt5 = safe_float(last5["amt"])
-        vol5 = safe_float(last5["vol"])
+        amt5 = safe_float(last5.get("amt"))
+        vol5 = safe_float(last5.get("vol"))
 
-        # 5m 成交额基准（Should-fix 2.1：动态窗口）
+        # 5m 成交额基准（动态）
         amt_series_5m = [x for x in df5["amt"].astype(float).tolist() if x is not None]
         amt_ma_5m = ma_dyn(amt_series_5m, 20, min_len=6)
 
-        # 1m 成交额基准（动态窗口，且早盘用 ORB 均额兜底）
-        last1 = get_last_completed_bar(df1, cutoff)
-        amt1 = safe_float(last1["amt"]) if last1 is not None else None
-        amt_series_1m = [x for x in df1["amt"].astype(float).tolist() if x is not None]
-        amt_ma_1m = ma_dyn(amt_series_1m, 60, min_len=20)
+        # 1m 成交额基准（动态；早盘用 ORB 均额兜底）
+        last1 = get_last_completed_bar(df1, cutoff) if one_min_available else None
+        amt1 = safe_float(last1.get("amt")) if last1 is not None else None
+        amt_ma_1m = None
+        if one_min_available:
+            amt_series_1m = [x for x in df1["amt"].astype(float).tolist() if x is not None]
+            amt_ma_1m = ma_dyn(amt_series_1m, 60, min_len=20)
         if amt_ma_1m is None and orb and orb.get("orb_amt_mean_1m") is not None:
-            # 早盘兜底：用 ORB 1m 均额作基准
             amt_ma_1m = float(orb["orb_amt_mean_1m"])
 
         events = []
@@ -580,7 +676,7 @@ def main():
                 events.append({"type": "ORB_DN_BREAK", "dir": "down",
                                "facts": {"t": fmt_dt(bar_t), "c": c, "orb_l": orb["orb_l"], "buf": buf}})
 
-        # ========== ② 锚位突破/失守（Should-fix 2.2：只看价格；量确认拆出去） ==========
+        # ========== ② 锚位突破/失守（拆分：只看价格） ==========
         anchor_buf = 0.001  # 10bp
         anchors = []
         if orb:
@@ -600,29 +696,27 @@ def main():
                     events.append({"type": f"ANCHOR_LOSE_{name}", "dir": "down",
                                    "facts": {"t": fmt_dt(bar_t), "c": c, "anchor": a, "buf": anchor_buf}})
 
-        # ========== ③ Spike（Should-fix 2.1：动态/ORB兜底） ==========
-        # 5m spike
+        # ========== ③ Spike ==========
         if amt5 is not None and amt_ma_5m not in (None, 0):
             ratio5 = amt5 / amt_ma_5m
             if ratio5 >= 3.0:
                 events.append({"type": "AMT_SPIKE_5M", "dir": "both",
                                "facts": {"t": fmt_dt(bar_t), "amt5": amt5, "ma_dyn": amt_ma_5m, "ratio": ratio5}})
 
-        # 1m spike
         if last1 is not None and amt1 is not None and amt_ma_1m not in (None, 0):
             ratio1 = amt1 / amt_ma_1m
             if ratio1 >= 4.0:
                 events.append({"type": "AMT_SPIKE_1M", "dir": "both",
                                "facts": {"t": fmt_dt(last1["time"]), "amt1": amt1, "ma_dyn_or_orb": amt_ma_1m, "ratio": ratio1}})
 
-        # ========== Break 确认事件（拆出来，不和 anchor 强绑定） ==========
+        # ========== 放量确认（拆出来） ==========
         if amt5 is not None and amt_ma_5m not in (None, 0):
             ratio = amt5 / amt_ma_5m
             if ratio >= 2.0:
                 events.append({"type": "BREAK_CONFIRM_VOL", "dir": "both",
                                "facts": {"t": fmt_dt(bar_t), "amt5": amt5, "ma_dyn": amt_ma_5m, "ratio": ratio}})
 
-        # ========== ④ 放量滞涨/放量下跌 ==========
+        # ========== ④ 放量滞涨 / 放量下跌 ==========
         ret5 = pct_change(c, o) if (c is not None and o is not None) else None
         if ret5 is not None and amt5 is not None and amt_ma_5m not in (None, 0):
             ratio = amt5 / amt_ma_5m
@@ -633,21 +727,22 @@ def main():
                 events.append({"type": "VOL_DOWN", "dir": "down",
                                "facts": {"t": fmt_dt(bar_t), "ret5_pct": ret5, "amt_ratio": ratio, "amt5": amt5}})
 
-        # ========== ⑤ 主动占比 proxy（带防误判） ==========
-        ap = active_proxy(df1, min_tot_amt_last30=5e6)
-        if ap and abs(float(ap["delta"])) >= 0.25:
-            events.append({"type": "ACTIVE_PROXY_SHIFT", "dir": "both", "facts": ap})
+        # ========== ⑤ 主动占比 proxy ==========
+        if one_min_available:
+            ap = active_proxy(df1, min_tot_amt_last30=5e6)
+            if ap and abs(float(ap["delta"])) >= 0.25:
+                events.append({"type": "ACTIVE_PROXY_SHIFT", "dir": "both", "facts": ap})
 
         # ========== ⑥⑦ 涨停 proxy ==========
-        if prev and prev.get("close") is not None:
+        if one_min_available and prev and prev.get("close") is not None:
             lim = estimate_limit_up(sym, float(prev["close"]))
             lp = limitup_proxy(df1, lim)
             if lp:
                 events.append({"type": lp["type"], "dir": lp["dir"], "facts": lp["facts"]})
 
-        # ========== ⑧ RS 偏离（Must-fix 1.2：按时间对齐） ==========
+        # ========== ⑧ RS 偏离（按time对齐；指数缺失则本轮跳过RS） ==========
         for idx_code, idxdf in idx_5m.items():
-            if idxdf is None or idxdf.empty:
+            if idxdf is None or getattr(idxdf, "empty", True):
                 continue
             rsz = calc_rs_z_aligned(df5, idxdf, cutoff, window=20)
             if rsz and abs(float(rsz["z"])) >= 2.0:
@@ -658,20 +753,19 @@ def main():
         if not events:
             continue
 
-        # ========== 冷却：先筛掉这次 run 不该推送的事件 ==========
+        # ========== 冷却：筛掉本轮不应推送的事件 ==========
         filtered = []
         for e in events:
             k = f"{sym}|{e['type']}|{e['dir']}"
             if should_push(state, k, cooldown_min, now_ts):
                 filtered.append((k, e))
-
         if not filtered:
             continue
 
-        # ========== Should-fix 2.4：TopN=5 截断，防刷屏 ==========
         filtered_events = [x[1] for x in filtered]
         filtered_events = sorted(filtered_events, key=event_rank)
 
+        # ========== TopN=5 防刷屏 ==========
         send_events = filtered_events[:TOPN]
         rest_events = filtered_events[TOPN:]
 
@@ -682,24 +776,32 @@ def main():
             context={"now_bj": t.isoformat()}
         )
 
+        # LLM 调用（失败也不致命 + 冷却错误推送）
         try:
-            analysis = llm_analyze(base_url, api_key, model, prompt, max_tokens=max_tokens)
+            analysis = llm_analyze(os.getenv("OPENAI_BASE_URL","").strip(),
+                                   os.getenv("OPENAI_API_KEY","").strip(),
+                                   os.getenv("OPENAI_MODEL","deepseek-chat").strip(),
+                                   prompt,
+                                   max_tokens=int(os.getenv("MAX_TOKENS","450")))
         except Exception as e:
-            push_err_once = f"{sym}|LLM_FAIL"
-            if should_push(state, push_err_once, cooldown_min, now_ts):
-                feishu_send_text(webhook, f"【盘中5m监控】{today} {sym}\nLLM调用失败: {repr(e)}")
-                mark_push(state, push_err_once, now_ts)
+            push_err(sym, "LLM_FAIL", f"【盘中5m监控】{today} {sym}\nLLM调用失败: {repr(e)}")
             continue
 
         msg = f"【盘中5m监控】{today} {sym} | 事件入LLM={len(send_events)}/{len(filtered_events)}(TopN={TOPN})\n" + analysis
         feishu_send_text(webhook, msg)
 
-        # 本次已发送的事件 key 才标记冷却（按实际 send_events + dir）
+        # 仅标记 send_events 进入冷却（避免“未入LLM也冷却导致丢信号”）
         for e in send_events:
             k = f"{sym}|{e['type']}|{e['dir']}"
             mark_push(state, k, now_ts)
 
     save_state(state)
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # 最终兜底：不让 workflow 打红（监控不断档）
+        print(f"[FATAL_BUT_NONBLOCKING] {repr(e)}")
+        raise SystemExit(0)
