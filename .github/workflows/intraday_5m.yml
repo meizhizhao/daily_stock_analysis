@@ -1,58 +1,96 @@
 name: intraday-5m-monitor
 
 on:
-  schedule:
-    - cron: "*/5 1-7 * * 1-5"   # UTC 01-07 每5分钟；脚本内再严格过滤北京时间交易时段
+  # 允许你手动点击 Run workflow
   workflow_dispatch: {}
+
+  # 自动定时：每 5 分钟运行一次（周一~周五）
+  # 说明：
+  # - GitHub cron 是 UTC
+  # - 北京时间 = UTC+8
+  # - A股交易时段（北京时间） 09:30-11:30 / 13:00-15:00
+  #   => UTC 01:30-03:30 / 05:00-07:00
+  schedule:
+    # 01:30-03:59 UTC（覆盖到 11:59 BJ，略多跑一些由脚本内过滤）
+    - cron: "*/5 30-59 1 * * 1-5"
+    - cron: "*/5 0-59 2-3 * * 1-5"
+    # 05:00-06:59 UTC（覆盖到 14:59 BJ）
+    - cron: "*/5 0-59 5-6 * * 1-5"
+    # 07:00 UTC（覆盖到 15:00 BJ 一次）
+    - cron: "0 7 * * 1-5"
 
 permissions:
   contents: read
 
+concurrency:
+  group: intraday-5m-monitor
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+
+      - name: Ensure state file exists
+        run: |
+          if [ ! -f intraday_state.json ]; then echo "{}" > intraday_state.json; fi
+          ls -la
+
+      # 缓存状态文件（让 cooldown / ORB 在不同 run 之间延续）
+      - name: Cache intraday state
+        uses: actions/cache@v4
+        with:
+          path: intraday_state.json
+          key: intraday-state-${{ github.repository }}-${{ github.ref_name }}
+          restore-keys: |
+            intraday-state-${{ github.repository }}-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install -U akshare requests pytz python-dateutil
-
-      - name: Restore intraday state cache
-        uses: actions/cache/restore@v4
-        with:
-          path: intraday_state.json
-          key: intraday-state-${{ github.ref_name }}-${{ github.run_id }}
-          restore-keys: |
-            intraday-state-${{ github.ref_name }}-
+          pip install -U akshare pandas requests pytz python-dateutil
 
       - name: Run intraday watcher
         env:
+          # ====== LLM (DeepSeek OpenAI-compatible) ======
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+
+          # ====== Push ======
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
 
-          STOCK_LIST: ${{ secrets.STOCK_LIST }}
-          INDEX_LIST: ${{ secrets.INDEX_LIST }}
-          COOLDOWN_MIN: ${{ secrets.COOLDOWN_MIN }}
-          ORB_BUFFER_BP: ${{ secrets.ORB_BUFFER_BP }}
-          MAX_TOKENS: ${{ secrets.MAX_TOKENS }}
-        run: |
-          python intraday_watch_5m.py
+          # ====== Watch list & params ======
+          STOCK_LIST: ${{ secrets.STOCK_LIST }}         # e.g. 002952
+          INDEX_LIST: ${{ secrets.INDEX_LIST }}         # e.g. 000300,000001
+          COOLDOWN_MIN: ${{ secrets.COOLDOWN_MIN }}     # e.g. 15
+          ORB_BUFFER_BP: ${{ secrets.ORB_BUFFER_BP }}   # e.g. 10
+          MAX_TOKENS: ${{ secrets.MAX_TOKENS }}         # e.g. 450
 
-      - name: Save intraday state cache
-        uses: actions/cache/save@v4
-        with:
-          path: intraday_state.json
-          key: intraday-state-${{ github.ref_name }}-${{ github.run_id }}
+          # ====== Optional debug switch ======
+          # 非交易时段测试才用：在 Secrets 里建 FORCE_RUN=1
+          # 平时建议不设或设为0
+          FORCE_RUN: ${{ secrets.FORCE_RUN }}
+        run: |
+          # 错开分钟边界，避免数据源上一根bar还没落地
+          sleep 15
+          python -u intraday_watch_5m.py
+
+      # 运行结束后把 intraday_state.json 再写回缓存（便于下次恢复）
+      # 注意：actions/cache 只能在 job 结束时写入一次；本 step 仅用于确认文件存在。
+      - name: Show state file (debug)
+        if: always()
+        run: |
+          echo "===== intraday_state.json ====="
+          cat intraday_state.json || true
