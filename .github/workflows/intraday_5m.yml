@@ -1,22 +1,22 @@
 name: intraday-5m-monitor
 
 on:
-  # 允许你手动点击 Run workflow
   workflow_dispatch: {}
 
-  # 自动定时：每 5 分钟运行一次（周一~周五）
-  # 说明：
-  # - GitHub cron 是 UTC
-  # - 北京时间 = UTC+8
-  # - A股交易时段（北京时间） 09:30-11:30 / 13:00-15:00
-  #   => UTC 01:30-03:30 / 05:00-07:00
+  # GitHub cron = UTC
+  # 北京时间(UTC+8) A股：09:30-11:30 / 13:00-15:00
+  # 对应 UTC：01:30-03:30 / 05:00-07:00
   schedule:
-    # 01:30-03:59 UTC（覆盖到 11:59 BJ，略多跑一些由脚本内过滤）
-    - cron: "*/5 30-59 1 * * 1-5"
-    - cron: "*/5 0-59 2-3 * * 1-5"
-    # 05:00-06:59 UTC（覆盖到 14:59 BJ）
-    - cron: "*/5 0-59 5-6 * * 1-5"
-    # 07:00 UTC（覆盖到 15:00 BJ 一次）
+    # 01:30-01:59 UTC：用固定分钟列表（避免 "*/5 30-59" 组合非法）
+    - cron: "30,35,40,45,50,55 1 * * 1-5"
+
+    # 02:00-03:59 UTC：每5分钟
+    - cron: "*/5 2-3 * * 1-5"
+
+    # 05:00-06:59 UTC：每5分钟
+    - cron: "*/5 5-6 * * 1-5"
+
+    # 07:00 UTC：跑一次（覆盖到北京时间 15:00）
     - cron: "0 7 * * 1-5"
 
 permissions:
@@ -63,32 +63,25 @@ jobs:
 
       - name: Run intraday watcher
         env:
-          # ====== LLM (DeepSeek OpenAI-compatible) ======
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
-          # ====== Push ======
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
 
-          # ====== Watch list & params ======
-          STOCK_LIST: ${{ secrets.STOCK_LIST }}         # e.g. 002952
-          INDEX_LIST: ${{ secrets.INDEX_LIST }}         # e.g. 000300,000001
-          COOLDOWN_MIN: ${{ secrets.COOLDOWN_MIN }}     # e.g. 15
-          ORB_BUFFER_BP: ${{ secrets.ORB_BUFFER_BP }}   # e.g. 10
-          MAX_TOKENS: ${{ secrets.MAX_TOKENS }}         # e.g. 450
+          STOCK_LIST: ${{ secrets.STOCK_LIST }}
+          INDEX_LIST: ${{ secrets.INDEX_LIST }}
+          COOLDOWN_MIN: ${{ secrets.COOLDOWN_MIN }}
+          ORB_BUFFER_BP: ${{ secrets.ORB_BUFFER_BP }}
+          MAX_TOKENS: ${{ secrets.MAX_TOKENS }}
 
-          # ====== Optional debug switch ======
-          # 非交易时段测试才用：在 Secrets 里建 FORCE_RUN=1
-          # 平时建议不设或设为0
+          # 可选：非交易时段测试才用（在 Secrets 里建 FORCE_RUN=1）
           FORCE_RUN: ${{ secrets.FORCE_RUN }}
         run: |
           # 错开分钟边界，避免数据源上一根bar还没落地
           sleep 15
           python -u intraday_watch_5m.py
 
-      # 运行结束后把 intraday_state.json 再写回缓存（便于下次恢复）
-      # 注意：actions/cache 只能在 job 结束时写入一次；本 step 仅用于确认文件存在。
       - name: Show state file (debug)
         if: always()
         run: |
