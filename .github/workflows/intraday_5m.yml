@@ -3,20 +3,20 @@ name: intraday-5m-monitor
 on:
   workflow_dispatch: {}
 
-  # GitHub cron = UTC
-  # 北京时间(UTC+8) A股：09:30-11:30 / 13:00-15:00
-  # 对应 UTC：01:30-03:30 / 05:00-07:00
+  # GitHub cron is UTC
+  # 北京时间(UTC+8) A股: 09:30-11:30 / 13:00-15:00
+  # 对应 UTC: 01:30-03:30 / 05:00-07:00
   schedule:
-    # 01:30-01:59 UTC：用固定分钟列表（避免 "*/5 30-59" 组合非法）
+    # 09:30-09:59 BJ (01:30-01:59 UTC) —— 用固定分钟列表，避开 GitHub 对某些组合 cron 的限制
     - cron: "30,35,40,45,50,55 1 * * 1-5"
 
-    # 02:00-03:59 UTC：每5分钟
+    # 10:00-11:59 BJ (02:00-03:59 UTC) —— 每5分钟
     - cron: "*/5 2-3 * * 1-5"
 
-    # 05:00-06:59 UTC：每5分钟
+    # 13:00-14:59 BJ (05:00-06:59 UTC) —— 每5分钟
     - cron: "*/5 5-6 * * 1-5"
 
-    # 07:00 UTC：跑一次（覆盖到北京时间 15:00）
+    # 15:00 BJ (07:00 UTC) —— 收盘补一跑（可选）
     - cron: "0 7 * * 1-5"
 
 permissions:
@@ -29,7 +29,35 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
+
+    env:
+      # ====== 必填 secrets（你需要在 repo Settings -> Secrets and variables -> Actions 设置）======
+      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+
+      # ====== 监控参数（可按需改，也可以改成 secrets/variables）======
+      STOCK_LIST: ${{ vars.STOCK_LIST }}
+      INDEX_LIST: ${{ vars.INDEX_LIST }}
+
+      # 事件冷却（分钟）：建议 10~20；你之前提“快照冷却2”是脚本层 SNAPSHOT_COOLDOWN_MIN
+      COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
+      ORB_BUFFER_BP: ${{ vars.ORB_BUFFER_BP }}
+      MAX_TOKENS: ${{ vars.MAX_TOKENS }}
+
+      # 脚本内快照冷却（分钟）：你要 2，就显式传；脚本里也有默认 2
+      SNAPSHOT_COOLDOWN_MIN: "2"
+
+      # 每只票LLM调用冷却（分钟）
+      SYM_LLM_COOLDOWN_MIN: ${{ vars.SYM_LLM_COOLDOWN_MIN }}
+
+      # 手动调试时才设置为 1；schedule 必须保持 0
+      FORCE_RUN: "0"
+
+      # 避免整分撞源：运行前 sleep 的秒数（10~20秒）
+      JITTER_SEC: "15"
 
     steps:
       - name: Checkout
@@ -39,52 +67,49 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-
-      - name: Ensure state file exists
-        run: |
-          if [ ! -f intraday_state.json ]; then echo "{}" > intraday_state.json; fi
-          ls -la
-
-      # 缓存状态文件（让 cooldown / ORB 在不同 run 之间延续）
-      - name: Cache intraday state
-        uses: actions/cache@v4
-        with:
-          path: intraday_state.json
-          key: intraday-state-${{ github.repository }}-${{ github.ref_name }}
-          restore-keys: |
-            intraday-state-${{ github.repository }}-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install -U akshare pandas requests pytz python-dateutil
+          pip install -r requirements.txt
+
+      # ---- 诊断：确认 schedule 是否真的触发 + 当前UTC/BJ时间 ----
+      - name: Debug trigger & time
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "ref=${{ github.ref }}"
+          echo "sha=${{ github.sha }}"
+          echo "UTC time:"
+          date -u
+          echo "BJ time:"
+          TZ=Asia/Shanghai date
+
+      # ---- 心跳：只要 workflow 启动就推送（用于判断 schedule 是否运行）----
+      - name: Heartbeat to Feishu
+        if: always()
+        env:
+          WEBHOOK: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          set -e
+          utc="$(date -u '+%F %T')"
+          bj="$(TZ=Asia/Shanghai date '+%F %T')"
+          payload='{"msg_type":"text","content":{"text":"【HEARTBEAT】intraday-5m-monitor started | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"'"}}'
+          curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK" >/dev/null || true
+
+      # ---- 错开分钟边界：避免上一根bar还没落地 ----
+      - name: Jitter before run
+        run: |
+          echo "sleep ${JITTER_SEC}s ..."
+          sleep "${JITTER_SEC}"
 
       - name: Run intraday watcher
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          SYM_LLM_COOLDOWN_MIN: ${{ secrets.SYM_LLM_COOLDOWN_MIN }}
-
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-
-          STOCK_LIST: ${{ secrets.STOCK_LIST }}
-          INDEX_LIST: ${{ secrets.INDEX_LIST }}
-          COOLDOWN_MIN: ${{ secrets.COOLDOWN_MIN }}
-          ORB_BUFFER_BP: ${{ secrets.ORB_BUFFER_BP }}
-          MAX_TOKENS: ${{ secrets.MAX_TOKENS }}
-
-          # 可选：非交易时段测试才用（在 Secrets 里建 FORCE_RUN=1）
-          FORCE_RUN: ${{ secrets.FORCE_RUN }}
         run: |
-          # 错开分钟边界，避免数据源上一根bar还没落地
-          sleep 15
-          python -u intraday_watch_5m.py
+          python intraday_watch_5m.py
 
-      - name: Show state file (debug)
-        if: always()
+      # ---- 失败时把关键上下文打出来（不泄露secret）----
+      - name: Print state file (if exists)
+        if: failure()
         run: |
-          echo "===== intraday_state.json ====="
-          cat intraday_state.json || true
+          echo "=== intraday_state.json (if exists) ==="
+          ls -la
+          test -f intraday_state.json && cat intraday_state.json || echo "no intraday_state.json"
