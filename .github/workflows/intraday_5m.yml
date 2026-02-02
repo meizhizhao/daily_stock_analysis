@@ -1,17 +1,18 @@
 name: intraday-5m-monitor
 
-on:
+# 关键：用引号避免 PyYAML 把 on 解析成 True (YAML 1.1)
+"on":
   workflow_dispatch: {}
 
   # GitHub cron is UTC
   # 北京时间(UTC+8) A股: 09:30-11:30 / 13:00-15:00
   # 对应 UTC: 01:30-03:30 / 05:00-07:00
   schedule:
-    # ======【测试用】验证 schedule 是否真的触发（验证通过后务必删除或关掉）======
-    - cron: "*/5 * * * *"
+    # ======【测试用】每5分钟跑一次（仅工作日），验证 schedule 是否触发；验证通过后删除 ======
+    - cron: "*/5 * * * 1-5"
 
-    # ======【正式】交易时段每5分钟（UTC）======
-    # 09:30-09:59 BJ (01:30-01:59 UTC) —— 用固定分钟列表，避开 GitHub 对某些组合 cron 的限制
+    # ======【正式】交易时段 ======
+    # 09:30-09:59 BJ (01:30-01:59 UTC) —— 固定分钟列表
     - cron: "30,35,40,45,50,55 1 * * 1-5"
 
     # 10:00-11:59 BJ (02:00-03:59 UTC) —— 每5分钟
@@ -36,13 +37,13 @@ jobs:
     timeout-minutes: 25
 
     env:
-      # ====== Secrets（必须在 Settings -> Secrets and variables -> Actions -> Secrets 配置）======
+      # ====== Secrets（必须配置）======
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
-      # ====== Variables（建议在 Settings -> Secrets and variables -> Actions -> Variables 配置）======
+      # ====== Variables（建议配置）======
       STOCK_LIST: ${{ vars.STOCK_LIST }}
       INDEX_LIST: ${{ vars.INDEX_LIST }}
       COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
@@ -50,10 +51,10 @@ jobs:
       MAX_TOKENS: ${{ vars.MAX_TOKENS }}
       SYM_LLM_COOLDOWN_MIN: ${{ vars.SYM_LLM_COOLDOWN_MIN }}
 
-      # 你要的“快照冷却=2”（脚本支持 env 则传；不支持也不影响运行）
+      # 你要的快照冷却=2（脚本支持则生效；不支持也不影响）
       SNAPSHOT_COOLDOWN_MIN: "2"
 
-      # 错开分钟边界：避免上一根 bar 还没落地
+      # 错开分钟边界：避免上一根bar还没落地
       JITTER_SEC: "15"
 
       # 手动调试才改 1；schedule 必须保持 0
@@ -73,18 +74,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # 测试用：yaml 解析依赖
           pip install pyyaml
 
-      # ---- 测试1：workflow YAML 自检（防缩进/语法错，避免“Invalid workflow file”）----
+      # ---- 测试1：workflow YAML 自检（修复 on/True 坑）----
       - name: Test - parse workflow yaml
         run: |
           python - <<'PY'
-          import yaml, pathlib, sys
+          import yaml, pathlib
           p = pathlib.Path(".github/workflows/intraday_5m.yml")
           data = yaml.safe_load(p.read_text(encoding="utf-8"))
           assert isinstance(data, dict), "workflow yaml should parse to dict"
-          assert "on" in data, "missing 'on' block"
+
+          # PyYAML(YAML 1.1) 可能把 on 解析成 True；两者都算通过
+          ok = ("on" in data) or (True in data) or ("\"on\"" in data)
+          assert ok, f"missing 'on' block (keys={list(data.keys())})"
+
           print("YAML parse OK. keys=", list(data.keys()))
           PY
 
@@ -99,7 +103,7 @@ jobs:
           echo "BJ time:"
           TZ=Asia/Shanghai date "+%F %T"
 
-      # ---- 测试3：Secrets/Variables 是否齐全（只检查是否为空，不打印内容）----
+      # ---- 测试3：Secrets/Variables 是否齐全（不打印敏感值）----
       - name: Test - check required env
         run: |
           set -e
@@ -115,13 +119,11 @@ jobs:
             fi
           }
 
-          # secrets
           check FEISHU_WEBHOOK_URL
           check OPENAI_BASE_URL
           check OPENAI_API_KEY
           check OPENAI_MODEL
 
-          # vars
           check STOCK_LIST
           check INDEX_LIST
           check COOLDOWN_MIN
@@ -144,7 +146,6 @@ jobs:
           payload='{"msg_type":"text","content":{"text":"【HEARTBEAT】intraday-5m-monitor started | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"' | branch=${{ github.ref_name }}"}}'
           curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK" >/dev/null || true
 
-      # ---- 错开分钟边界：避免上一根bar还没落地 ----
       - name: Jitter before run
         run: |
           echo "sleep ${JITTER_SEC}s ..."
@@ -154,7 +155,7 @@ jobs:
         run: |
           python intraday_watch_5m.py
 
-      # ---- 失败时：把关键上下文输出（不泄露 secret）并推送一条错误摘要 ----
+      # ---- 失败时：打印上下文 + 推送错误摘要 ----
       - name: Failure - print state & logs
         if: failure()
         run: |
