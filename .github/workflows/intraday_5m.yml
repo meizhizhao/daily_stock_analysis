@@ -8,11 +8,11 @@ name: intraday-5m-monitor
   # 北京时间(UTC+8) A股: 09:30-11:30 / 13:00-15:00
   # 对应 UTC: 01:30-03:30 / 05:00-07:00
   schedule:
-    # ======【测试用】每5分钟跑一次（仅工作日），验证 schedule 是否触发；验证通过后删除 ======
-    - cron: "*/5 * * * 1-5"
+    # ======【测试用】每15分钟跑一次（仅工作日），验证 schedule 是否触发；验证通过后可删除或改回5分钟 ======
+    - cron: "*/15 * * * 1-5"
 
-    # ======【正式】交易时段 ======
-    # 09:30-09:59 BJ (01:30-01:59 UTC) —— 固定分钟列表
+    # ======【正式】交易时段：每5分钟 ======
+    # 09:30-09:59 BJ (01:30-01:59 UTC) —— 固定分钟列表（避开某些组合 cron 限制）
     - cron: "30,35,40,45,50,55 1 * * 1-5"
 
     # 10:00-11:59 BJ (02:00-03:59 UTC) —— 每5分钟
@@ -36,29 +36,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
+    # 这里做“兜底默认值”，彻底解决你截图里的 Missing env
     env:
-      # ====== Secrets（必须配置）======
+      # ====== Secrets（必须在 Settings -> Secrets and variables -> Actions -> Secrets 里配置）======
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
-      # ====== Variables（建议配置）======
-      STOCK_LIST: ${{ vars.STOCK_LIST }}
-      INDEX_LIST: ${{ vars.INDEX_LIST }}
-      COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
-      ORB_BUFFER_BP: ${{ vars.ORB_BUFFER_BP }}
-      MAX_TOKENS: ${{ vars.MAX_TOKENS }}
-      SYM_LLM_COOLDOWN_MIN: ${{ vars.SYM_LLM_COOLDOWN_MIN }}
+      # ====== Variables（可选；没配就用默认值）======
+      STOCK_LIST: ${{ vars.STOCK_LIST || '002952' }}
+      INDEX_LIST: ${{ vars.INDEX_LIST || '000300,000001' }}
+      COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN || '15' }}
+      ORB_BUFFER_BP: ${{ vars.ORB_BUFFER_BP || '10' }}
+      MAX_TOKENS: ${{ vars.MAX_TOKENS || '450' }}
+      SYM_LLM_COOLDOWN_MIN: ${{ vars.SYM_LLM_COOLDOWN_MIN || '4' }}
 
-      # 你要的快照冷却=2（脚本支持则生效；不支持也不影响）
-      SNAPSHOT_COOLDOWN_MIN: "2"
+      # 你要的：快照冷却=2（脚本若读取该 env 则生效；不读取也不影响）
+      SNAPSHOT_COOLDOWN_MIN: ${{ vars.SNAPSHOT_COOLDOWN_MIN || '2' }}
 
-      # 错开分钟边界：避免上一根bar还没落地
-      JITTER_SEC: "15"
+      # 错开分钟边界：避免数据源上一根bar没落地
+      JITTER_SEC: ${{ vars.JITTER_SEC || '15' }}
 
-      # 手动调试才改 1；schedule 必须保持 0
-      FORCE_RUN: "0"
+      # 手动调试用：正常保持 0；要强制非交易时段跑才设 1
+      FORCE_RUN: ${{ vars.FORCE_RUN || '0' }}
 
     steps:
       - name: Checkout
@@ -84,11 +85,9 @@ jobs:
           p = pathlib.Path(".github/workflows/intraday_5m.yml")
           data = yaml.safe_load(p.read_text(encoding="utf-8"))
           assert isinstance(data, dict), "workflow yaml should parse to dict"
-
           # PyYAML(YAML 1.1) 可能把 on 解析成 True；两者都算通过
-          ok = ("on" in data) or (True in data) or ("\"on\"" in data)
+          ok = ("on" in data) or (True in data) or ('"on"' in data)
           assert ok, f"missing 'on' block (keys={list(data.keys())})"
-
           print("YAML parse OK. keys=", list(data.keys()))
           PY
 
@@ -97,14 +96,14 @@ jobs:
         run: |
           echo "event=${{ github.event_name }}"
           echo "ref=${{ github.ref }}"
-          echo "sha=${{ github.sha }}"
+          echo "branch=${{ github.ref_name }}"
           echo "UTC time:"
           date -u "+%F %T"
           echo "BJ time:"
           TZ=Asia/Shanghai date "+%F %T"
 
-      # ---- 测试3：Secrets/Variables 是否齐全（不打印敏感值）----
-      - name: Test - check required env
+      # ---- 测试3：检查必需 Secrets 是否存在（不打印敏感值）----
+      - name: Test - check required secrets
         run: |
           set -e
           missing=0
@@ -124,18 +123,11 @@ jobs:
           check OPENAI_API_KEY
           check OPENAI_MODEL
 
-          check STOCK_LIST
-          check INDEX_LIST
-          check COOLDOWN_MIN
-          check ORB_BUFFER_BP
-          check MAX_TOKENS
-          check SYM_LLM_COOLDOWN_MIN
-
           if [ "$missing" -eq 1 ]; then
             exit 1
           fi
 
-      # ---- 心跳：确认 schedule 确实启动（不依赖脚本是否产出事件）----
+      # ---- 心跳：确认 schedule / manual 确实启动（不依赖脚本是否产出事件）----
       - name: Heartbeat to Feishu
         if: always()
         env:
@@ -143,7 +135,7 @@ jobs:
         run: |
           utc="$(date -u '+%F %T')"
           bj="$(TZ=Asia/Shanghai date '+%F %T')"
-          payload='{"msg_type":"text","content":{"text":"【HEARTBEAT】intraday-5m-monitor started | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"' | branch=${{ github.ref_name }}"}}'
+          payload='{"msg_type":"text","content":{"text":"【HEARTBEAT】intraday-5m-monitor started | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"' | branch=${{ github.ref_name }} | stock_list='${STOCK_LIST}'"}}'
           curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK" >/dev/null || true
 
       - name: Jitter before run
@@ -151,6 +143,7 @@ jobs:
           echo "sleep ${JITTER_SEC}s ..."
           sleep "${JITTER_SEC}"
 
+      # ---- 正式运行脚本 ----
       - name: Run intraday watcher
         run: |
           python intraday_watch_5m.py
@@ -171,5 +164,5 @@ jobs:
         run: |
           utc="$(date -u '+%F %T')"
           bj="$(TZ=Asia/Shanghai date '+%F %T')"
-          payload='{"msg_type":"text","content":{"text":"【FAIL】intraday-5m-monitor failed | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"' | run=${{ github.run_id }} | 查看 Actions 日志定位原因"}}'
+          payload='{"msg_type":"text","content":{"text":"【FAIL】intraday-5m-monitor failed | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"' | branch=${{ github.ref_name }} | run=${{ github.run_id }} | 打开 Actions 日志定位具体错误"}}'
           curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK" >/dev/null || true
