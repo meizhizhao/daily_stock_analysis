@@ -45,7 +45,7 @@ jobs:
       OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-
+      echo "OPENAI_MODEL='$OPENAI_MODEL'"
       # ====== Variables（可选；没配就用默认值）======
       # 关键：inputs(手动) > vars(仓库变量) > 默认
       STOCK_LIST: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.stock_list != '' && github.event.inputs.stock_list) || vars.STOCK_LIST || '002952' }}
