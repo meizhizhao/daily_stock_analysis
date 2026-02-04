@@ -1,31 +1,32 @@
 name: intraday-5m-monitor
 
-# 用引号避免 PyYAML(YAML 1.1) 把 on 解析成 True
-"on":
+on:
   workflow_dispatch:
     inputs:
       stock_list:
-        description: "逗号分隔，如 002952,603172；留空则使用仓库变量 vars.STOCK_LIST"
+        description: "股票列表(逗号分隔)，例如：002952,000425。留空则用仓库变量/默认"
+        required: false
+        default: ""
+      index_list:
+        description: "指数基准(逗号分隔)，例如：000300,000001。留空则用仓库变量/默认"
         required: false
         default: ""
       force_run:
-        description: "1=强制非交易时段也运行（测试用）；0=仅交易时段"
+        description: "1=强制运行(不在交易时段也跑)，0=仅交易时段"
         required: false
         default: "0"
-
-  # GitHub cron is UTC
-  # 北京时间(UTC+8) A股: 09:30-11:30 / 13:00-15:00
-  # 对应 UTC: 01:30-03:30 / 05:00-07:00
+      model:
+        description: "模型名：deepseek-chat / deepseek-reasoner（留空则用 Secret/默认）"
+        required: false
+        default: ""
+      max_tokens:
+        description: "reasoner建议>=1200；留空则用仓库变量/默认"
+        required: false
+        default: ""
   schedule:
-    # ======【正式】交易时段：每5分钟 ======
-    # 09:30-09:59 BJ (01:30-01:59 UTC)
-    - cron: "30,35,40,45,50,55 1 * * 1-5"
-    # 10:00-11:59 BJ (02:00-03:59 UTC)
-    - cron: "*/5 2-3 * * 1-5"
-    # 13:00-14:59 BJ (05:00-06:59 UTC)
-    - cron: "*/5 5-6 * * 1-5"
-    # 15:00 BJ (07:00 UTC) 收盘补一跑（可选）
-    - cron: "0 7 * * 1-5"
+    # GitHub cron 是 UTC；这里设为：工作日每5分钟跑一次 (UTC 01:00-07:59 = 北京 09:00-15:59)
+    # 午休时段脚本会自动退出（in_trading_session），因此不会推送。
+    - cron: "*/5 1-7 * * 1-5"
 
 permissions:
   contents: read
@@ -44,26 +45,18 @@ jobs:
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-     
-      # ====== Variables（可选；没配就用默认值）======
-      # 关键：inputs(手动) > vars(仓库变量) > 默认
-      STOCK_LIST: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.stock_list != '' && github.event.inputs.stock_list) || vars.STOCK_LIST || '002952' }}
+      OPENAI_MODEL_SECRET: ${{ secrets.OPENAI_MODEL }}
 
-      INDEX_LIST: ${{ vars.INDEX_LIST || '000300,000001' }}
-      COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN || '15' }}
-      ORB_BUFFER_BP: ${{ vars.ORB_BUFFER_BP || '10' }}
-      MAX_TOKENS: ${{ vars.MAX_TOKENS || '450' }}
-      SYM_LLM_COOLDOWN_MIN: ${{ vars.SYM_LLM_COOLDOWN_MIN || '4' }}
-
-      # 快照冷却（无事件也推送快照的脚本会用到）
-      SNAPSHOT_COOLDOWN_MIN: ${{ vars.SNAPSHOT_COOLDOWN_MIN || '2' }}
-
-      # 错开分钟边界：避免数据源上一根bar还没落地
-      JITTER_SEC: ${{ vars.JITTER_SEC || '15' }}
-
-      # FORCE_RUN：手动输入优先，其次 vars，最后默认0
-      FORCE_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.force_run != '' && github.event.inputs.force_run) || vars.FORCE_RUN || '0' }}
+      # ====== Variables（可选；配置在 Settings -> Secrets and variables -> Actions -> Variables）======
+      VAR_STOCK_LIST: ${{ vars.STOCK_LIST }}
+      VAR_INDEX_LIST: ${{ vars.INDEX_LIST }}
+      VAR_COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
+      VAR_ORB_BUFFER_BP: ${{ vars.ORB_BUFFER_BP }}
+      VAR_MAX_TOKENS: ${{ vars.MAX_TOKENS }}
+      VAR_SYM_LLM_COOLDOWN_MIN: ${{ vars.SYM_LLM_COOLDOWN_MIN }}
+      VAR_JITTER_SEC: ${{ vars.JITTER_SEC }}
+      VAR_FORCE_RUN: ${{ vars.FORCE_RUN }}
+      VAR_SNAPSHOT_COOLDOWN_MIN: ${{ vars.SNAPSHOT_COOLDOWN_MIN }}
 
     steps:
       - name: Checkout
@@ -73,103 +66,156 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyyaml
+          python -V
+          pip install -U pip
+          # 你的脚本依赖：requests pandas akshare python-dateutil
+          pip install -U requests pandas akshare python-dateutil tqdm
 
-      # ---- 测试1：workflow YAML 自检（避免 on 被解析成 True 的误报）----
-      - name: Test - parse workflow yaml
+      # ====== TEST 1: 解析&自检（确保 on/schedule/workflow_dispatch 都存在）======
+      - name: Test - parse workflow yaml (self-check)
+        shell: bash
         run: |
           python - <<'PY'
-          import yaml, pathlib
+          import sys, pathlib
           p = pathlib.Path(".github/workflows/intraday_5m.yml")
-          data = yaml.safe_load(p.read_text(encoding="utf-8"))
-          assert isinstance(data, dict), "workflow yaml should parse to dict"
-          ok = ("on" in data) or (True in data) or ('"on"' in data)
-          assert ok, f"missing 'on' block (keys={list(data.keys())})"
-          print("YAML parse OK. keys=", list(data.keys()))
+          if not p.exists():
+            raise SystemExit("missing workflow file: .github/workflows/intraday_5m.yml")
+          s = p.read_text(encoding="utf-8", errors="ignore")
+          # 极简自检：防止你再次把 on: 写坏/删掉
+          assert "on:" in s, "missing 'on:' block"
+          assert "schedule:" in s, "missing 'schedule:'"
+          assert "workflow_dispatch:" in s, "missing 'workflow_dispatch:'"
+          print("OK: workflow yaml basic structure present")
           PY
 
-      # ---- 测试2：打印触发器 & 时间（UTC/BJ）----
-      - name: Test - debug trigger & time
+      # ====== TEST 2: 解析输入/变量优先级，形成最终 env ======
+      - name: Resolve runtime env (inputs > vars > defaults)
+        shell: bash
+        run: |
+          # inputs（手动 run 才有）
+          IN_STOCK_LIST="${{ github.event.inputs.stock_list }}"
+          IN_INDEX_LIST="${{ github.event.inputs.index_list }}"
+          IN_FORCE_RUN="${{ github.event.inputs.force_run }}"
+          IN_MODEL="${{ github.event.inputs.model }}"
+          IN_MAX_TOKENS="${{ github.event.inputs.max_tokens }}"
+
+          # vars（仓库变量）
+          V_STOCK_LIST="${VAR_STOCK_LIST}"
+          V_INDEX_LIST="${VAR_INDEX_LIST}"
+          V_COOLDOWN_MIN="${VAR_COOLDOWN_MIN}"
+          V_ORB_BUFFER_BP="${VAR_ORB_BUFFER_BP}"
+          V_MAX_TOKENS="${VAR_MAX_TOKENS}"
+          V_SYM_LLM_COOLDOWN_MIN="${VAR_SYM_LLM_COOLDOWN_MIN}"
+          V_JITTER_SEC="${VAR_JITTER_SEC}"
+          V_FORCE_RUN="${VAR_FORCE_RUN}"
+          V_SNAPSHOT_COOLDOWN_MIN="${VAR_SNAPSHOT_COOLDOWN_MIN}"
+
+          # defaults（最后兜底）
+          FINAL_STOCK_LIST="${IN_STOCK_LIST:-${V_STOCK_LIST:-002952}}"
+          FINAL_INDEX_LIST="${IN_INDEX_LIST:-${V_INDEX_LIST:-000300,000001}}"
+          FINAL_COOLDOWN_MIN="${V_COOLDOWN_MIN:-15}"
+          FINAL_ORB_BUFFER_BP="${V_ORB_BUFFER_BP:-10}"
+          FINAL_MAX_TOKENS="${IN_MAX_TOKENS:-${V_MAX_TOKENS:-1200}}"
+          FINAL_SYM_LLM_COOLDOWN_MIN="${V_SYM_LLM_COOLDOWN_MIN:-4}"
+          FINAL_JITTER_SEC="${V_JITTER_SEC:-15}"
+          FINAL_FORCE_RUN="${IN_FORCE_RUN:-${V_FORCE_RUN:-0}}"
+          FINAL_SNAPSHOT_COOLDOWN_MIN="${V_SNAPSHOT_COOLDOWN_MIN:-2}"
+
+          # model：input > secret > default
+          FINAL_MODEL="${IN_MODEL:-${OPENAI_MODEL_SECRET:-deepseek-chat}}"
+
+          {
+            echo "STOCK_LIST=${FINAL_STOCK_LIST}"
+            echo "INDEX_LIST=${FINAL_INDEX_LIST}"
+            echo "COOLDOWN_MIN=${FINAL_COOLDOWN_MIN}"
+            echo "ORB_BUFFER_BP=${FINAL_ORB_BUFFER_BP}"
+            echo "MAX_TOKENS=${FINAL_MAX_TOKENS}"
+            echo "SYM_LLM_COOLDOWN_MIN=${FINAL_SYM_LLM_COOLDOWN_MIN}"
+            echo "JITTER_SEC=${FINAL_JITTER_SEC}"
+            echo "FORCE_RUN=${FINAL_FORCE_RUN}"
+            echo "SNAPSHOT_COOLDOWN_MIN=${FINAL_SNAPSHOT_COOLDOWN_MIN}"
+            echo "OPENAI_MODEL=${FINAL_MODEL}"
+          } >> "$GITHUB_ENV"
+
+      - name: Debug env (stock/index/model)
         run: |
           echo "event=${{ github.event_name }}"
-          echo "ref=${{ github.ref }}"
           echo "branch=${{ github.ref_name }}"
-          echo "UTC time:" && date -u "+%F %T"
-          echo "BJ time:" && TZ=Asia/Shanghai date "+%F %T"
+          echo "FINAL STOCK_LIST='${STOCK_LIST}'"
+          echo "FINAL INDEX_LIST='${INDEX_LIST}'"
+          echo "FORCE_RUN='${FORCE_RUN}'"
+          echo "OPENAI_MODEL='${OPENAI_MODEL}'"
+          echo "MAX_TOKENS='${MAX_TOKENS}'"
+          echo "SYM_LLM_COOLDOWN_MIN='${SYM_LLM_COOLDOWN_MIN}'"
+          echo "SNAPSHOT_COOLDOWN_MIN='${SNAPSHOT_COOLDOWN_MIN}'"
+          echo "COOLDOWN_MIN='${COOLDOWN_MIN}' ORB_BUFFER_BP='${ORB_BUFFER_BP}' JITTER_SEC='${JITTER_SEC}'"
 
-      # ---- 关键：打印 STOCK_LIST 最终值，定位“为什么还是旧票”----
-      - name: Debug env (stock/index)
-        run: |
-          echo "inputs.stock_list='${{ github.event.inputs.stock_list }}'"
-          echo "vars.STOCK_LIST='${{ vars.STOCK_LIST }}'"
-          echo "FINAL STOCK_LIST='$STOCK_LIST'"
-          echo "FINAL INDEX_LIST='$INDEX_LIST'"
-          echo "FORCE_RUN='$FORCE_RUN' SNAPSHOT_COOLDOWN_MIN='$SNAPSHOT_COOLDOWN_MIN'"
-          echo "OPENAI_MODEL='$OPENAI_MODEL'"
-
-      # ---- 测试3：检查必需 Secrets 是否存在（不打印敏感值）----
+      # ====== TEST 3: 必要 secrets 检查（缺一个就失败，并发飞书）======
       - name: Test - check required secrets
+        shell: bash
         run: |
-          set -e
-          missing=0
-          check() {
-            name="$1"
-            val="${!name}"
-            if [ -z "$val" ]; then
-              echo "::error::Missing env: $name"
-              missing=1
-            else
-              echo "OK: $name"
+          miss=0
+          for k in FEISHU_WEBHOOK_URL OPENAI_BASE_URL OPENAI_API_KEY; do
+            v="${!k}"
+            if [ -z "$v" ]; then
+              echo "Missing secret env: $k"
+              miss=1
             fi
-          }
-          check FEISHU_WEBHOOK_URL
-          check OPENAI_BASE_URL
-          check OPENAI_API_KEY
-          check OPENAI_MODEL
-          if [ "$missing" -eq 1 ]; then
+          done
+          if [ "$miss" -eq 1 ]; then
             exit 1
           fi
 
-      # ---- 心跳：无论脚本是否产出事件，都能证明“跑起来了 + 用了哪只票”----
       - name: Heartbeat to Feishu
-        if: always()
-        env:
-          WEBHOOK: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        shell: bash
         run: |
-          utc="$(date -u '+%F %T')"
-          bj="$(TZ=Asia/Shanghai date '+%F %T')"
-          payload='{"msg_type":"text","content":{"text":"【HEARTBEAT】intraday-5m-monitor started | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"' | branch=${{ github.ref_name }} | stock_list='"${STOCK_LIST}"' | force_run='"${FORCE_RUN}"'"}}'
-          curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK" >/dev/null || true
+          UTC_NOW="$(date -u '+%Y-%m-%d %H:%M:%S')"
+          BJ_NOW="$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          TEXT="【HEARTBEAT】intraday-5m-monitor started | event=${{ github.event_name }} | UTC=${UTC_NOW} | BJ=${BJ_NOW} | branch=${{ github.ref_name }} | stock_list=${STOCK_LIST} | model=${OPENAI_MODEL}"
+          curl -sS -X POST "${FEISHU_WEBHOOK_URL}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"${TEXT}\"}}"
+
+      # ====== 状态缓存：保存 intraday_state.json（冷却/ORB 依赖它）======
+      - name: Restore intraday state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: intraday_state.json
+          key: intraday-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            intraday-state-${{ github.ref_name }}-
 
       - name: Jitter before run
+        shell: bash
         run: |
-          echo "sleep ${JITTER_SEC}s ..."
+          echo "sleep ${JITTER_SEC}s to avoid minute boundary"
           sleep "${JITTER_SEC}"
 
       - name: Run intraday watcher
+        shell: bash
         run: |
+          # 你的脚本在仓库根目录：intraday_watch_5m.py
           python intraday_watch_5m.py
 
-      - name: Failure - print state & logs
-        if: failure()
-        run: |
-          echo "=== ls -la ==="
-          ls -la
-          echo "=== intraday_state.json (if exists) ==="
-          test -f intraday_state.json && cat intraday_state.json || echo "no intraday_state.json"
+      - name: Save intraday state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: intraday_state.json
+          key: intraday-state-${{ github.ref_name }}-${{ github.run_id }}
 
+      # ====== 失败时：把关键信息推到飞书，方便你手机排障 ======
       - name: Failure - notify Feishu
         if: failure()
-        env:
-          WEBHOOK: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        shell: bash
         run: |
-          utc="$(date -u '+%F %T')"
-          bj="$(TZ=Asia/Shanghai date '+%F %T')"
-          payload='{"msg_type":"text","content":{"text":"【FAIL】intraday-5m-monitor failed | event=${{ github.event_name }} | UTC='"$utc"' | BJ='"$bj"' | branch=${{ github.ref_name }} | run=${{ github.run_id }} | 打开 Actions 日志查看具体错误"}}'
-          curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK" >/dev/null || true
+          UTC_NOW="$(date -u '+%Y-%m-%d %H:%M:%S')"
+          BJ_NOW="$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="【FAIL】intraday-5m-monitor failed | event=${{ github.event_name }} | UTC=${UTC_NOW} | BJ=${BJ_NOW} | branch=${{ github.ref_name }} | stock_list=${STOCK_LIST} | model=${OPENAI_MODEL} | run=${RUN_URL}"
+          curl -sS -X POST "${FEISHU_WEBHOOK_URL}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"${TEXT}\"}}"
